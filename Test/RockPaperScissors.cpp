@@ -22,6 +22,25 @@ public:
 
 protected:
     void handleMessage(const NeuroWebsocketpp::NeuroResponse &response) override {
+        //Data comes from Neuro, have to be checked
+        if (response.getData().empty()) {
+            //Handle case of empty data here. Might be OK, might be not, depends your usecase.
+        }
+        else {
+            try {
+                nlohmann::json data = nlohmann::json::parse(response.getData());
+                auto dataStr = data.dump();
+            }
+            //Error will be thrown if JSON provided by Neuro is not actually valid JSON
+            catch (const std::exception& e) {
+                //You should respond to malformed data with a failed result
+                std::string resp = "Your JSON data is invalid.";
+                std::cerr << "Error parsing JSON: " << e.what() << std::endl;
+                sendActionResult(response, false, resp);
+                return;
+
+            }
+        }
         if (waitingForForcedAction) {
             if (response.getName() == "play_paper") {
                 std::string resp = "You win!";
@@ -66,7 +85,7 @@ protected:
 int main() {
     RPS rps{};
 
-    NeuroRPS client("ws://172.27.16.1:8000", "Rock Paper Scissors", rps, &std::cout, &std::cerr);
+    NeuroRPS client("ws://localhost:8000", "Rock Paper Scissors", rps, &std::cout, &std::cerr);
     int rounds = 50;
     nlohmann::json schema;
     nlohmann::json empty_schema;
@@ -74,12 +93,12 @@ int main() {
     schema["properties"]["hand"]["type"] = "string";
     NeuroWebsocketpp::Action rock = NeuroWebsocketpp::Action("play_rock", "Play Rock with right or left hand", schema);
     NeuroWebsocketpp::Action paper = NeuroWebsocketpp::Action("play_paper", "Play Paper with right or left hand",
-                                                              schema);
+                                                              empty_schema);
     NeuroWebsocketpp::Action scissors = NeuroWebsocketpp::Action("play_scissors",
                                                                  "Play Scissors with right or left hand", schema);
     NeuroWebsocketpp::Action middleFinger = NeuroWebsocketpp::Action("middle_finger",
                                                                      "Show middle finger with right or left hand",
-                                                                     schema);
+                                                                     empty_schema);
 
     client.sendStartup();
     client.sendRegisterActions(std::vector<NeuroWebsocketpp::Action>{middleFinger});

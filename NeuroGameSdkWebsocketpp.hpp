@@ -78,7 +78,13 @@ namespace NeuroWebsocketpp {
 
             id = parsedJson["data"]["id"];
             name = parsedJson["data"]["name"];
-            data = parsedJson["data"]["data"];
+            try {
+                data = parsedJson["data"]["data"];
+            } //if data is null need to treat is as empty string
+            catch (const std::exception&) {
+                data = "";
+            }
+
 
         } catch (const nlohmann::json::parse_error& e) {
             throw std::invalid_argument("Invalid JSON string: " + std::string(e.what()));
