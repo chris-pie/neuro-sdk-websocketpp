@@ -6,6 +6,7 @@ This is a fairly barebones SDK for incorporating [Neuro-Sama API](https://github
 This is a header-only library but it requires following dependencies:
 
 [nlohmann/json](https://github.com/nlohmann/json) - heder only version can be downloaded from that repo's releases page
+
 [zaphoyd/websocketpp](https://github.com/zaphoyd/websocketpp) - included as a submodule. This one requires Boost to be installed.
 
 See example project in Test/RockPaperScissors.cpp for an idea of how to use this SDK.
