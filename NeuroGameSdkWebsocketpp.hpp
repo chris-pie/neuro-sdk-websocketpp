@@ -32,6 +32,7 @@ namespace NeuroWebsocketpp {
                 return "low";
         }
     }
+
     class Action {
     public:
         // Constructor
@@ -56,36 +57,38 @@ namespace NeuroWebsocketpp {
         nlohmann::json schema;
     };
 
-
-    class NeuroResponse {
-    public:
-        explicit NeuroResponse(const std::string& jsonStr);
-        std::string getCommand() const {
-            return command;
-        }
-        std::string getId() const {
-            return id;
-        }
-        std::string getName() const {
-            return name;
-        }
-        std::string getData() const {
-            return data;
-        }
+    class NeuroResponse 
+    {
     private:
         std::string command;
         std::string id;
         std::string name;
         std::string data;
+        std::string sessionId;
+        std::string characterId;
+        std::string displayName;
+
+    public:
+        explicit NeuroResponse(const std::string& jsonStr);
+        std::string getCommand() const { return command; }
+        std::string getId() const { return id; }
+        std::string getName() const { return name; }
+        std::string getData() const { return data; }
+        std::string getSessionId() const { return sessionId; }
+        std::string getCharacterId() const { return characterId; }
+        std::string getDisplayName() const { return displayName; }
     };
 
     inline NeuroResponse::NeuroResponse(const std::string& jsonStr) {
         try {
             if (jsonStr.empty()) {
+                command = "";
                 id = "";
                 name = "";
                 data = "";
-                command = "";
+                sessionId = "";
+                characterId = "";
+                displayName = "";
                 return;
             }
             nlohmann::json parsedJson = nlohmann::json::parse(jsonStr);
@@ -96,16 +99,32 @@ namespace NeuroWebsocketpp {
                 throw std::invalid_argument("JSON is missing the 'command' field or it is not a string.");
             }
 
+            if (parsedJson.contains("data") && parsedJson["data"].is_object()) {
+                auto& dataObj = parsedJson["data"];
 
-            id = parsedJson["data"]["id"];
-            name = parsedJson["data"]["name"];
-            try {
-                data = parsedJson["data"]["data"];
-            } //if data is null need to treat is as empty string
-            catch (const std::exception&) {
-                data = "";
+                if (dataObj.contains("id") && dataObj["id"].is_string()) {
+                    id = dataObj["id"];
+                }
+                if (dataObj.contains("name") && dataObj["name"].is_string()) {
+                    name = dataObj["name"];
+                }
+                if (dataObj.contains("data") && dataObj["data"].is_string()) {
+                    data = dataObj["data"];
+                }
+
+                if (dataObj.contains("session") && dataObj["session"].is_object()) {
+                    auto& sessionObj = dataObj["session"];
+                    if (sessionObj.contains("sessionId") && sessionObj["sessionId"].is_string()) {
+                        sessionId = sessionObj["sessionId"];
+                    }
+                    if (sessionObj.contains("characterId") && sessionObj["characterId"].is_string()) {
+                        characterId = sessionObj["characterId"];
+                    }
+                    if (sessionObj.contains("displayName") && sessionObj["displayName"].is_string()) {
+                        displayName = sessionObj["displayName"];
+                    }
+                }
             }
-
 
         } catch (const nlohmann::json::parse_error& e) {
             throw std::invalid_argument("Invalid JSON string: " + std::string(e.what()));
@@ -121,6 +140,7 @@ namespace NeuroWebsocketpp {
     using websocketpp::connection_hdl;
     using client = websocketpp::client<websocketpp::config::asio_client>;
     typedef websocketpp::config::asio_client::message_type::ptr message_ptr;
+
     class NeuroGameClient {
     public:
         virtual ~NeuroGameClient() {
@@ -141,7 +161,6 @@ namespace NeuroWebsocketpp {
                 reconnect_thread.join();
             }
         }
-
 
         NeuroGameClient(const std::string& uri, std::string  game_name, std::ostream* output_stream = &std::cout, std::ostream* error_stream = &std::cerr, int timeout = -1, bool retry_on_fail = true)
             : game_name(std::move(game_name)), lastResponse(""), timeout(timeout), uri(uri), retry_on_fail(retry_on_fail) {
@@ -203,10 +222,12 @@ namespace NeuroWebsocketpp {
                 }
             }
         }
+
         void sendStartup() {
             nlohmann::json payload;
             payload["game"] = game_name;
             payload["command"] = "startup";
+            
             //Block until connection is established for startup.
             std::unique_lock<std::mutex> lock(reconnectMutex);
             if (!(connected ||  shutting_down)) {
@@ -297,10 +318,11 @@ namespace NeuroWebsocketpp {
             }
             forcedActions.clear();
         }
-    //Helper function that registers actions, sends force action request for them, then stores sent actions in disposableActions field
-    //so that they can't be unregistered in handleMessage method. If forceUnregister is true, it will unregister them just before exiting
-    //as a failsafe, but this shouldn't be relied on - unregister should happen in handleMessage before sending action result.
-    void forceDisposableActions(const std::string& state, const std::string& query, bool ephemeral, const std::vector<Action>& actions, bool forceUnregister = false, Priority priority = Priority::LOW) {
+
+        //Helper function that registers actions, sends force action request for them, then stores sent actions in disposableActions field
+        //so that they can't be unregistered in handleMessage method. If forceUnregister is true, it will unregister them just before exiting
+        //as a failsafe, but this shouldn't be relied on - unregister should happen in handleMessage before sending action result.
+        void forceDisposableActions(const std::string& state, const std::string& query, bool ephemeral, const std::vector<Action>& actions, bool forceUnregister = false, Priority priority = Priority::LOW) {
             sendRegisterActions(actions);
             disposableActions = getActionNamesFromActions(actions);
             forceAction(state, query, ephemeral, getActionNamesFromActions(actions), priority);
@@ -318,16 +340,12 @@ namespace NeuroWebsocketpp {
         return actionNames;
     }
 
-
-
     protected:
         void on_open(connection_hdl hdl) {
             *output << "Connection established!" << std::endl;
             ws_hdl = std::move(hdl);
             connected = true;
             condition.notify_all();
-
-
         }
 
 
@@ -401,8 +419,6 @@ namespace NeuroWebsocketpp {
                 }
 
             }
-
-
         }
 
         void connect(const std::string& uri) {
