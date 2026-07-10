@@ -123,6 +123,7 @@ namespace NeuroWebsocketpp {
     typedef websocketpp::config::asio_client::message_type::ptr message_ptr;
     class NeuroGameClient {
     public:
+
         virtual ~NeuroGameClient() {
             shutting_down = true;
             if (connected) {
@@ -336,6 +337,11 @@ namespace NeuroWebsocketpp {
         //When valid action arrives, set waitingForForcedAction to false to continue execution
         //Remember to unregister actions and send action result to Neuro ASAP
         virtual void handleMessage(NeuroResponse const& response) = 0;
+        //Override this method to handle startup acknowledgement.
+        //Optional. Startup acknowledgement data is also stored in NeuroGameClient object.
+        virtual void handleStartupAcknowledgement(std::string const& _sessionId, std::string const& _characterId, std::string const& _displayName) {
+
+        };
 
         virtual void on_message(const connection_hdl&, const client::message_ptr& msg) {
             {
@@ -344,6 +350,19 @@ namespace NeuroWebsocketpp {
                 auto JsonMessage = nlohmann::json::parse(message);
                 if (JsonMessage["command"] == "actions/reregister_all")
                     return;
+                if (JsonMessage["command"] == "startup")
+                {
+                    try {
+                        sessionId = JsonMessage["data"]["session"]["sessionId"];
+                        characterId = JsonMessage["data"]["session"]["characterId"];
+                        displayName = JsonMessage["data"]["session"]["displayName"];
+                        handleStartupAcknowledgement(sessionId, characterId, displayName);
+                        return;
+                    }
+                    catch (const std::exception& e) {
+                        throw std::invalid_argument("Startup acknowledgement was received but as malformed: " + std::string(e.what()));
+                    }
+                }
                 NeuroResponse const response = NeuroResponse(message);
                 handleMessage(response);
                 lastResponse = response;
@@ -433,11 +452,26 @@ namespace NeuroWebsocketpp {
         NeuroResponse lastResponse;
         bool waitingForForcedAction = false;
         bool connected = false;
+        std::string sessionId;
+        std::string characterId;
+        std::string displayName;
 
     public:
         bool isConnected() const {
             return connected;
         }
+        std::string session_id() const {
+            return sessionId;
+        }
+
+        std::string character_id() const {
+            return characterId;
+        }
+
+        std::string display_name() const {
+            return displayName;
+        }
+
 
     protected:
         std::vector<std::string> forcedActions;

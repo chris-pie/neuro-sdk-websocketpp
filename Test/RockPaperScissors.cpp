@@ -79,6 +79,9 @@ protected:
 
     }
 
+    void handleStartupAcknowledgement(std::string const& _sessionId, std::string const& _characterId, std::string const& _displayName) override {
+        std::cout << "Startup acknowledgment received with session ID: " << _sessionId << ", character ID: " << _characterId << ", display name: " << _displayName << std::endl;
+    }
     RPS &rps;
 };
 
