@@ -4,7 +4,9 @@ project(neuro_game_sdk_websocketpp)
 
 set(CMAKE_CXX_STANDARD 11)
 
+include_directories(include)
+add_compile_definitions(_WEBSOCKETPP_CPP11_THREAD_)
+link_libraries(ws2_32)
+add_compile_definitions(ASIO_STANDALONE)
 add_executable(NeuroRPS Test/RockPaperScissors.cpp)
-find_package(Boost REQUIRED COMPONENTS system)
-include_directories(${Boost_INCLUDE_DIRS})
 include_directories(websocketpp)
