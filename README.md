@@ -7,7 +7,7 @@ This is a header-only library but it requires following dependencies:
 
 [nlohmann/json](https://github.com/nlohmann/json) - header only version can be downloaded from that repo's releases page
 
-[zaphoyd/websocketpp](https://github.com/zaphoyd/websocketpp) - included as a submodule. This one requires Boost to be installed.
+[zaphoyd/websocketpp](https://github.com/zaphoyd/websocketpp) - included as a submodule. This one requires asio (added in include folder).
 
 See example project in Test/RockPaperScissors.cpp for an idea of how to use this SDK.
 
