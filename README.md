@@ -15,5 +15,14 @@ NeuroGameClient is an abstract class that you should extend and override its han
 You shouldn't use sendForceAction method directly, instead use forceAction which will block program execution until Neuro responds and prevent race conditions.
 For timeout, set a value in seconds after which forceAction will throw an error. Set to -1 to wait forever.
 Set URL to empty string to use NEURO_SDK_WS_URL environment variable (as required by Vedal).
-If connection closes Neuro client will automatically attempt to reconnect.
+If the connection closes, Neuro client will automatically attempt to reconnect.
 Neuro client automatically connects during construction and disconnects during destruction. If you want it to stop reconnecting for any reason you need to delete the object.
+
+For voice chat integration, use NeuroVoiceClient class. Similarly override pure virtual methods. After connecting you need to 
+manually call startVoiceSession. You can call stopVoiceSession to end voice session without disconnecting from the websocket.
+To send voice samples use VoiceSampleStream; it splits samples into chunks automatically. Don't use
+sendVoiceSamples manually unless you can't VoiceSampleStream for some reason. 
+
+### Note that you need to resample your voice data yourself.
+
+Test/VoiceTest.cpp contains a simple example on how to use NeuroVoiceClient. 
