@@ -124,6 +124,7 @@ namespace NeuroWebsocketpp {
     using websocketpp::connection_hdl;
     using client = websocketpp::client<websocketpp::config::asio_client>;
     typedef websocketpp::config::asio_client::message_type::ptr message_ptr;
+
     class NeuroGameClient {
     public:
         virtual ~NeuroGameClient() {
@@ -161,7 +162,6 @@ namespace NeuroWebsocketpp {
             ws_client.set_fail_handler([this](connection_hdl &&PH1) { on_fail(std::forward<decltype(PH1)>(PH1)); });
             reconnect_thread = std::thread(&NeuroGameClient::_connect, this);
         }
-
 
 
         void sendStartup() {
@@ -323,8 +323,7 @@ namespace NeuroWebsocketpp {
         std::vector<std::string> disposableActions;
 
     private:
-
-                void reconnect() {
+        void reconnect() {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             _connect();
         }
@@ -392,7 +391,7 @@ namespace NeuroWebsocketpp {
         }
 
 
-        virtual void on_message(const connection_hdl &, const client::message_ptr &msg) { {
+        void on_message(const connection_hdl &, const client::message_ptr &msg) { {
                 std::lock_guard<std::mutex> lock(mutex);
                 auto message = msg->get_payload();
                 auto JsonMessage = nlohmann::json::parse(message);
@@ -418,9 +417,6 @@ namespace NeuroWebsocketpp {
             condition.notify_all();
         }
 
-
-
-    private:
         void on_close(const connection_hdl &) {
             connected = false;
             *output << "Connection closed. Reconnecting..." << std::endl;
