@@ -125,6 +125,618 @@ namespace NeuroWebsocketpp {
     using client = websocketpp::client<websocketpp::config::asio_client>;
     typedef websocketpp::config::asio_client::message_type::ptr message_ptr;
 
+    enum VoiceChatAvailable {
+        INITIALIZING, // Voice chat still initializing, unknown
+        VOICE_CHAT_AVAILABLE, // Server returned voice/ready
+        VOICE_CHAT_UNAVAILABLE, // Connection failed or server returned voice/unavailable
+    };
+
+    class NeuroVoiceClient {
+    public:
+        virtual ~NeuroVoiceClient() {
+            shutting_down = true;
+            if (voice_chat_available) {
+                websocketpp::lib::error_code ec;
+                ws_client.close(ws_hdl, websocketpp::close::status::going_away, "Shutting down", ec);
+                if (ec) {
+                    *error << "Error closing WebSocket connection: " << ec.message() << std::endl;
+                }
+                ws_client.stop();
+            }
+            condition.notify_all();
+            if (connection_thread.joinable()) {
+                connection_thread.join();
+            }
+            if (reconnect_thread.joinable()) {
+                reconnect_thread.join();
+            }
+        }
+
+
+        NeuroVoiceClient(const std::string &uri, std::string game_name, std::ostream *output_stream = &std::cout,
+                         std::ostream *error_stream = &std::cerr, int timeout = -1)
+            : game_name(std::move(game_name)), lastResponse(""), timeout(timeout), uri(uri) {
+            output = output_stream;
+            error = error_stream;
+            ws_client.init_asio();
+            ws_client.set_open_handler([this](connection_hdl &&PH1) { on_open(std::forward<decltype(PH1)>(PH1)); });
+            ws_client.set_message_handler([this](connection_hdl &&PH1, message_ptr &&PH2) {
+                on_message(std::forward<decltype(PH1)>(PH1), std::forward<decltype(PH2)>(PH2));
+            });
+            ws_client.set_close_handler([this](connection_hdl &&PH1) { on_close(std::forward<decltype(PH1)>(PH1)); });
+            ws_client.set_fail_handler([this](connection_hdl &&PH1) { on_fail(std::forward<decltype(PH1)>(PH1)); });
+            reconnect_thread = std::thread(&NeuroVoiceClient::_connect, this);
+        }
+
+
+        void startVoiceSession() {
+            nlohmann::json payload;
+            payload["game"] = game_name;
+            payload["command"] = "voice/start";
+            //Block until connection is established for startup.
+            std::unique_lock<std::mutex> lock(reconnectMutex);
+            if (!(connected || shutting_down)) {
+                condition.wait(lock, [this]() { return connected || shutting_down; });
+            }
+            lock.unlock();
+            send_startup(payload.dump());
+        }
+
+        void stopVoiceSession() {
+            nlohmann::json payload;
+            payload["game"] = game_name;
+            payload["command"] = "voice/stop";
+            voice_chat_available = VOICE_CHAT_UNAVAILABLE;
+            speakers.clear();
+            send(payload.dump());
+        }
+
+        void sendRegisterSpeakers(const std::vector<std::string> &speakers) {
+            nlohmann::json payload;
+            payload["game"] = game_name;
+            payload["command"] = "voice/speakers/register";
+            payload["data"]["speakers"] = nlohmann::json::array();
+            for (const auto &speaker: speakers) {
+                int id = speaker_id++;
+                this->speakers[id] = speaker;
+                nlohmann::json speaker_json;
+                speaker_json["name"] = speaker;
+                speaker_json["id"] = id;
+                payload["data"]["speakers"].push_back(speaker_json);
+            }
+            send(payload.dump());
+        }
+
+        void sendUnregisterSpeakers(const std::vector<std::string> &speaker_names) {
+            auto ids = speaker_names_to_ids(speaker_names);
+            sendUnregisterSpeakers(ids);
+        }
+
+        void sendUnregisterSpeakers(const std::vector<int> &speaker_ids) {
+            nlohmann::json payload;
+            payload["game"] = game_name;
+            payload["command"] = "voice/speakers/unregister";
+            nlohmann::json speakers_json;
+            for (const auto &speaker: speaker_ids) {
+                speakers_json.push_back(speaker);
+                this->speakers.erase(speaker);
+            }
+            payload["data"]["ids"] = speakers_json;
+            send(payload.dump());
+        }
+
+
+        void sendRenameSpeaker(const std::string &old_name, const std::string &new_name) {
+            int id = speaker_name_to_id(old_name);
+            sendRenameSpeaker(id, new_name);
+        }
+
+        void sendRenameSpeaker(const int id, const std::string &new_name) {
+            nlohmann::json payload;
+            payload["game"] = game_name;
+            payload["command"] = "voice/speakers/register";
+            payload["data"]["speakers"] = nlohmann::json::array();
+            this->speakers[id] = new_name;
+            nlohmann::json speaker_json;
+            speaker_json["name"] = new_name;
+            speaker_json["id"] = id;
+            payload["data"]["speakers"].push_back(speaker_json);
+            send(payload.dump());
+        }
+
+        //Send PCM samples directly
+        //You should use VoiceSampleStream instead for automatic splitting but this is kept public just in case.
+        void sendVoiceSamples(int speaker_id,
+                              const float *samples,
+                              std::size_t sample_count) {
+            if (speaker_id < 0 || speaker_id > 0xFFFF) {
+                throw std::invalid_argument("speaker_id must fit in uint16_t");
+            }
+
+            if (sample_count != 0 && samples == nullptr) {
+                throw std::invalid_argument("samples must not be null");
+            }
+
+            // Header: 4 bytes, followed by 4 bytes per float sample.
+            std::string message;
+            message.reserve(4 + sample_count * sizeof(float));
+
+            message.push_back(1); // Protocol version
+            message.push_back(0); // Reserved flags
+
+            const auto speaker =
+                    static_cast<std::uint16_t>(speaker_id);
+
+            // Speaker ID, little-endian.
+            message.push_back(static_cast<char>(speaker & 0xFF));
+            message.push_back(static_cast<char>((speaker >> 8) & 0xFF));
+
+            // PCM samples encoded as little-endian float32 values.
+            for (std::size_t i = 0; i < sample_count; ++i) {
+                std::uint32_t bits = 0;
+                static_assert(sizeof(bits) == sizeof(samples[i]),
+                              "float must be 32 bits");
+
+                std::memcpy(&bits, &samples[i], sizeof(bits));
+
+                message.push_back(static_cast<char>(bits & 0xFF));
+                message.push_back(static_cast<char>((bits >> 8) & 0xFF));
+                message.push_back(static_cast<char>((bits >> 16) & 0xFF));
+                message.push_back(static_cast<char>((bits >> 24) & 0xFF));
+            }
+
+            this->send(message, websocketpp::frame::opcode::binary);
+        }
+
+        class VoiceSampleStream {
+        public:
+            static constexpr std::size_t samples_per_frame = 960;
+
+            VoiceSampleStream(NeuroVoiceClient &client, int speaker_id)
+                : client_(&client),
+                  speaker_id_(speaker_id),
+                  finished_(false) {
+                if (speaker_id < 0 || speaker_id > 0xFFFF) {
+                    throw std::invalid_argument(
+                        "speaker_id must fit in uint16_t");
+                }
+
+                buffer_.reserve(samples_per_frame);
+            }
+
+            VoiceSampleStream(const VoiceSampleStream &) = delete;
+
+            VoiceSampleStream &operator=(const VoiceSampleStream &) = delete;
+
+            VoiceSampleStream(VoiceSampleStream &&other)
+                noexcept : client_(other.client_),
+                           speaker_id_(other.speaker_id_),
+                           buffer_(std::move(other.buffer_)),
+                           finished_(other.finished_) {
+                other.client_ = nullptr;
+                other.finished_ = true;
+            }
+
+            VoiceSampleStream &operator=(VoiceSampleStream &&) = delete;
+
+            void write(const float *samples, std::size_t sample_count) {
+                if (finished_) {
+                    throw std::logic_error(
+                        "Cannot write to a finished voice stream");
+                }
+
+                if (sample_count != 0 && samples == nullptr) {
+                    throw std::invalid_argument(
+                        "samples must not be null");
+                }
+
+                // Complete a previously buffered partial frame first.
+                if (!buffer_.empty()) {
+                    const std::size_t required =
+                            samples_per_frame - buffer_.size();
+                    const std::size_t copied =
+                            std::min(required, sample_count);
+
+                    buffer_.insert(
+                        buffer_.end(), samples, samples + copied);
+
+                    samples += copied;
+                    sample_count -= copied;
+
+                    if (buffer_.size() == samples_per_frame) {
+                        client_->sendVoiceSamples(
+                            speaker_id_,
+                            buffer_.data(),
+                            buffer_.size());
+                        buffer_.clear();
+                    }
+                }
+
+                // Send complete frames directly from the caller's memory.
+                while (sample_count >= samples_per_frame) {
+                    client_->sendVoiceSamples(
+                        speaker_id_, samples, samples_per_frame);
+
+                    samples += samples_per_frame;
+                    sample_count -= samples_per_frame;
+                }
+
+                // Preserve the remaining partial frame for the next write.
+                if (sample_count != 0) {
+                    buffer_.insert(
+                        buffer_.end(), samples, samples + sample_count);
+                }
+            }
+
+            void write(const std::vector<float> &samples) {
+                write(samples.data(), samples.size());
+            }
+
+            VoiceSampleStream &operator()(
+                const float *samples,
+                const std::size_t sample_count) {
+                write(samples, sample_count);
+                return *this;
+            }
+
+            void finish() {
+                if (finished_) {
+                    return;
+                }
+
+                // Mark the stream finished only after a successful send,
+                // allowing finish() to be retried if sending throws.
+                if (!buffer_.empty()) {
+                    client_->sendVoiceSamples(
+                        speaker_id_,
+                        buffer_.data(),
+                        buffer_.size());
+                    buffer_.clear();
+                }
+
+                finished_ = true;
+            }
+
+            bool finished() const {
+                return finished_;
+            }
+
+        private:
+            NeuroVoiceClient *client_;
+            int speaker_id_;
+            std::vector<float> buffer_;
+            bool finished_;
+        };
+
+        VoiceSampleStream createVoiceStream(int speaker_id) {
+            return VoiceSampleStream(*this, speaker_id);
+        }
+
+        bool isConnected() const {
+            return connected;
+        }
+
+        VoiceChatAvailable get_voice_chat_available() const {
+            return voice_chat_available;
+        }
+
+        std::map<int, std::string> get_speakers() const {
+            return speakers;
+        }
+
+    protected:
+        std::ostream *output;
+        std::ostream *error;
+
+        //Override this method to handle incoming voice data from Neuro
+        virtual void handleVoiceData(std::string const &data) = 0;
+
+        //Override this method to handle when Neuro starts/stops speaking.
+        virtual void handleSpeakingChanged(bool speaking) = 0;
+
+        //Override this method to handle when Neuro gets interrupted/[FILTERED].
+        //You MUST mute her immediately and discard any buffered audio.
+        virtual void handleCancelled() = 0;
+
+        //Optionally override these methods to handle the startup acknowledgement/failure.
+        //Alternatively the parameter values are stored in the object and can be accessed via getters at any time.
+        virtual void handleStartupAcknowledgement(int sample_rate, int channels) {
+        }
+
+        virtual void handleStartupFail(std::string const &reason) {
+        }
+
+    private:
+        std::vector<int> speaker_names_to_ids(const std::vector<std::string> &names) const {
+            std::vector<int> ids;
+            for (const auto &speaker: names) {
+                ids.push_back(speaker_name_to_id(speaker));
+            }
+            return ids;
+        }
+
+        int speaker_name_to_id(const std::string &name) const {
+            for (const auto &pair: this->speakers) {
+                if (pair.second == name) {
+                    return pair.first;
+                }
+            }
+            throw std::runtime_error("Speaker not found: " + name);
+        }
+
+        void reconnect() {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            _connect();
+        }
+
+        static std::string derive_uri(const std::string &base_uri,
+                                      const std::string &game) {
+            if (base_uri.empty() || game.empty()) {
+                return {};
+            }
+
+            std::string finalUri = base_uri;
+            std::string query;
+
+            const std::size_t queryPos = finalUri.find('?');
+            if (queryPos != std::string::npos) {
+                query = finalUri.substr(queryPos);
+                finalUri.erase(queryPos);
+            }
+
+            while (!finalUri.empty() && finalUri.back() == '/') {
+                finalUri.pop_back();
+            }
+
+            static constexpr char hex[] = "0123456789ABCDEF";
+            std::string encodedGame;
+            encodedGame.reserve(game.size());
+
+            for (char it : game) {
+                const auto character =
+                        static_cast<unsigned char>(it);
+
+                const bool unreserved =
+                        (character >= 'A' && character <= 'Z') ||
+                        (character >= 'a' && character <= 'z') ||
+                        (character >= '0' && character <= '9') ||
+                        character == '-' ||
+                        character == '_' ||
+                        character == '.' ||
+                        character == '~';
+
+                if (unreserved) {
+                    encodedGame.push_back(static_cast<char>(character));
+                } else {
+                    encodedGame.push_back('%');
+                    encodedGame.push_back(hex[(character >> 4) & 0x0F]);
+                    encodedGame.push_back(hex[character & 0x0F]);
+                }
+            }
+
+            std::string path;
+            const std::string gamePrefix = "/game/";
+            const std::size_t gameIndex = finalUri.rfind(gamePrefix);
+
+            if (finalUri.size() >= 5 &&
+                finalUri.compare(finalUri.size() - 5, 5, "/game") == 0) {
+                path = finalUri + "/" + encodedGame + "/voice";
+            } else if (gameIndex != std::string::npos &&
+                       finalUri.find('/', gameIndex + gamePrefix.size()) ==
+                       std::string::npos) {
+                // Already .../game/<name>; reuse the existing name segment.
+                path = finalUri + "/voice";
+            } else {
+                path = finalUri + "/game/" + encodedGame + "/voice";
+            }
+
+            return path + query;
+        }
+
+
+        void _connect() {
+            std::unique_lock<std::mutex> lock(reconnectMutex);
+            _failed_reconnecting = false;
+            if (connection_thread.joinable()) {
+                connection_thread.join();
+            }
+            if (shutting_down) {
+                return;
+            }
+            std::string baseUri = !uri.empty()
+                                      ? uri
+                                      : std::getenv("NEURO_SDK_WS_URL")
+                                            ? std::getenv("NEURO_SDK_WS_URL")
+                                            : "";
+
+            if (baseUri.empty()) {
+                *error << "URI was not provided. Set NEURO_SDK_WS_URL environment variable." << std::endl;
+                throw std::runtime_error("URI was not provided. Set NEURO_SDK_WS_URL environment variable.");
+            }
+
+            std::string finalUri = derive_uri(baseUri, game_name);
+
+            connection_thread = std::thread(&NeuroVoiceClient::connect, this, finalUri);
+            if (timeout >= 0) {
+                bool success = condition.wait_for(lock, std::chrono::seconds(timeout), [this]() {
+                    return connected || connection_failed || _failed_reconnecting || shutting_down;
+                });
+                if (!success || connection_failed) {
+                    *error << "Failed to connect to server" << std::endl;
+                    voice_chat_available = VOICE_CHAT_UNAVAILABLE;
+                    throw std::runtime_error("Failed to connect to server");
+                }
+            } else {
+                condition.wait(lock, [this]() {
+                    return connected || connection_failed || _failed_reconnecting || shutting_down;
+                });
+                if (connection_failed) {
+                    *error << "Failed to connect to server" << std::endl;
+                    voice_chat_available = VOICE_CHAT_UNAVAILABLE;
+                }
+            }
+            if (connection_failed || _failed_reconnecting || shutting_down) {
+                return;
+            }
+            while (!messageQueue.empty()) {
+                std::string msg = messageQueue.front();
+                messageQueue.pop();
+                websocketpp::lib::error_code ec;
+                ws_client.send(ws_hdl, msg, websocketpp::frame::opcode::text, ec);
+                if (ec) {
+                    *error << "Error sending stored message after reconnect: " << ec.message() << std::endl;
+                    throw std::runtime_error("Error sending stored message after reconnect");
+                }
+            }
+        }
+
+        void on_open(connection_hdl hdl) {
+            *output << "Connection established!" << std::endl;
+            connected = true;
+            ws_hdl = std::move(hdl);
+            condition.notify_all();
+        }
+
+
+        void on_message(const connection_hdl &, const client::message_ptr &msg) {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto opcode = msg->get_opcode();
+            if (opcode == websocketpp::frame::opcode::text) {
+                auto message = msg->get_payload();
+                auto JsonMessage = nlohmann::json::parse(message);
+                if (JsonMessage["command"] == "voice/cancelled") {
+                    handleCancelled();
+                    return;
+                }
+                if (JsonMessage["command"] == "voice/ready") {
+                    try {
+                        sample_rate = JsonMessage["data"]["sample_rate"];
+                        channels = JsonMessage["data"]["channels"];
+                        handleStartupAcknowledgement(sample_rate, channels);
+                        voice_chat_available = VOICE_CHAT_AVAILABLE;
+                        return;
+                    } catch (const std::exception &e) {
+                        throw std::invalid_argument(
+                            "Startup acknowledgement was received but as malformed: " + std::string(e.what()));
+                    }
+                }
+                if (JsonMessage["command"] == "voice/unavailable") {
+                    std::string fail_reason;
+                    try {
+                        fail_reason = JsonMessage["data"]["reason"];
+                    } catch (...) {
+                        //if no reason present
+                        fail_reason = "";
+                    }
+                    handleStartupFail(fail_reason);
+                    voice_chat_available = VOICE_CHAT_UNAVAILABLE;
+                    return;
+                }
+                if (JsonMessage["command"] == "voice/speaking") {
+                    const bool speaking = JsonMessage["data"]["speaking"];
+                    handleSpeakingChanged(speaking);
+                    return;
+                }
+                NeuroResponse const response = NeuroResponse(message);
+                lastResponse = response;
+            } else if (opcode == websocketpp::frame::opcode::binary) {
+                handleVoiceData(msg->get_payload());
+            }
+            condition.notify_all();
+        }
+
+        void on_close(const connection_hdl &) {
+            voice_chat_available = INITIALIZING;
+            connected = false;
+            *output << "Connection closed. Reconnecting..." << std::endl;
+            _failed_reconnecting = true;
+            condition.notify_all();
+            if (reconnect_thread.joinable()) {
+                reconnect_thread.join();
+            }
+            reconnect_thread = std::thread(&NeuroVoiceClient::reconnect, this);
+        }
+
+        void on_fail(const connection_hdl &) {
+            //For voice chat, fail is to be treated as voice chat unavailable.
+            std::lock_guard<std::mutex> lock(mutex);
+            *error << "Voice chat: Connection failed!" << std::endl;
+            voice_chat_available = VOICE_CHAT_UNAVAILABLE;
+            //Don't try to reconnect or throw, just keep a disconnected object.
+        }
+
+        void send(const std::string &message,
+                  websocketpp::frame::opcode::value format = websocketpp::frame::opcode::text) {
+            std::lock_guard<std::mutex> lock(reconnectMutex);
+            if (connection_failed) {
+                *error << "Trying to send message on a failed connection" << std::endl;
+                throw std::runtime_error("Trying to send message on a failed connection");
+            }
+            if (voice_chat_available != VOICE_CHAT_AVAILABLE) {
+                std::cerr << "Voice chat is unavailable. Cannot send message." << std::endl;
+                throw std::runtime_error("Voice chat is unavailable. Cannot send message.");
+            }
+            websocketpp::lib::error_code ec;
+            ws_client.send(ws_hdl, message, format, ec);
+            if (ec) {
+                *error << "Error sending message: " << ec.message() << std::endl;
+            }
+        }
+
+        void send_startup(const std::string &message) {
+            std::lock_guard<std::mutex> lock(reconnectMutex);
+            if (connection_failed) {
+                *error << "Trying to send message on a failed connection" << std::endl;
+                throw std::runtime_error("Trying to send message on a failed connection");
+            }
+            websocketpp::lib::error_code ec;
+            ws_client.send(ws_hdl, message, websocketpp::frame::opcode::text, ec);
+            if (ec) {
+                *error << "Error sending message: " << ec.message() << std::endl;
+            }
+        }
+
+
+        void connect(const std::string &uri) {
+            websocketpp::lib::error_code ec;
+            connection_failed = false;
+            ws_client.reset();
+            auto con = ws_client.get_connection(uri, ec);
+
+            if (ec) {
+                *error << "Error creating connection: " << ec.message() << std::endl;
+                voice_chat_available = VOICE_CHAT_UNAVAILABLE;
+                return;
+            }
+
+            ws_client.connect(con);
+            ws_client.run();
+        }
+
+        client ws_client;
+        connection_hdl ws_hdl;
+
+        std::string game_name;
+        std::thread connection_thread;
+        std::thread reconnect_thread;
+        std::mutex mutex;
+        std::mutex reconnectMutex;
+        std::condition_variable condition;
+        NeuroResponse lastResponse;
+        std::map<int, std::string> speakers;
+        int speaker_id = 1;
+        VoiceChatAvailable voice_chat_available = INITIALIZING;
+        bool connected = false;
+        int sample_rate;
+        int channels;
+        int timeout;
+        bool connection_failed = false;
+        std::string uri;
+        std::queue<std::string> messageQueue;
+        bool _failed_reconnecting = false;
+        bool shutting_down = false;
+    };
+
     class NeuroGameClient {
     public:
         virtual ~NeuroGameClient() {
