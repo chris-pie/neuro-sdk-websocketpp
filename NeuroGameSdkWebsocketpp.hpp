@@ -929,6 +929,11 @@ namespace NeuroWebsocketpp {
                                                   std::string const &_displayName) {
         };
 
+        //Override this method to handle 'speech_finished' response.
+        //Optional.
+        //see https://github.com/VedalAI/neuro-sdk/blob/main/API/SPECIFICATION.md#speech-finished
+        virtual void handleSpeechFinished(bool is_final, bool cancelled, std::string const& reason) {};
+
         std::ostream *output;
         std::ostream *error;
         bool waitingForForcedAction = false;
@@ -1020,6 +1025,21 @@ namespace NeuroWebsocketpp {
                         throw std::invalid_argument(
                             "Startup acknowledgement was received but as malformed: " + std::string(e.what()));
                     }
+                }
+                if (JsonMessage["command"] == "speech_finished") {
+                    bool is_final = JsonMessage["data"]["isFinal"];
+                    bool cancelled;
+                    std::string reason;
+                    try {
+                        cancelled = JsonMessage["data"]["cancelled"];
+                        reason = JsonMessage["data"]["reason"];
+                    } catch (...) //cancelled or reason not present, assume false and empty.
+                    {
+                        cancelled = false;
+                        reason = "";
+                    }
+                    handleSpeechFinished(is_final, cancelled, reason);
+                    return;
                 }
                 NeuroResponse const response = NeuroResponse(message);
                 handleMessage(response);
